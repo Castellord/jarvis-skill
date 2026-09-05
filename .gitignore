@@ -1,0 +1,4 @@
+# Рабочие правила — рантайм-артефакт конкретной установки, а не часть скилла.
+# Создаются командой: python3 scripts/jarvis.py init --team <ID> --project <ID>
+# Шаблон лежит в templates/routing-rules.example.yaml
+assets/routing-rules.yaml

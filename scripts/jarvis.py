@@ -24,7 +24,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 
 try:
     from zoneinfo import ZoneInfo
@@ -47,6 +47,21 @@ EMPTY = {
     "senders_hardened": [],
     "routing": {},
     "defaults": {"team": "", "project": ""},
+}
+
+# Дефолтный путь к правилам якорится к самому скрипту, а не к текущей рабочей
+# директории: иначе запуск не из каталога скилла молча даёт пустые team/project.
+SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_RULES_PATH = os.path.join(SKILL_DIR, "assets", "routing-rules.yaml")
+
+# Статусы Linear переименовывают в каждой команде, поэтому опираемся в первую
+# очередь на statusType, а имя используем как фолбэк.
+CLOSED_TYPES = {"completed", "canceled", "cancelled"}
+CLOSED_NAMES = {"done", "completed", "cancelled", "canceled", "closed"}
+STARTED_TYPES = {"started"}
+STARTED_NAMES = {
+    "in progress", "in_progress", "started", "doing", "in review",
+    "in_review", "review", "в работе", "в процессе",
 }
 
 
@@ -91,9 +106,16 @@ def _fallback_load(text: str) -> dict:
         return raw
 
     def _split_top(s: str) -> list:
-        parts, depth, buf = [], 0, ""
+        parts, depth, buf, quote = [], 0, "", ""
         for ch in s:
-            if ch in "[{":
+            if quote:
+                buf += ch
+                if ch == quote:
+                    quote = ""
+                continue
+            if ch in "\"'":
+                quote = ch
+            elif ch in "[{":
                 depth += 1
             elif ch in "]}":
                 depth -= 1
@@ -178,7 +200,9 @@ def _fallback_load(text: str) -> dict:
 
 def load_rules(path: str) -> dict:
     if not os.path.exists(path):
-        return json.loads(json.dumps(EMPTY))
+        missing = json.loads(json.dumps(EMPTY))
+        missing["_found"] = False
+        return missing
     with open(path, "r", encoding="utf-8") as fh:
         text = fh.read()
     data = _yaml.safe_load(text) if _yaml else _fallback_load(text)
@@ -191,6 +215,7 @@ def load_rules(path: str) -> dict:
     for key in ("noise", "senders_hardened"):
         if data.get(key) is None:
             data[key] = []
+    data["_found"] = True
     return data
 
 
@@ -217,8 +242,11 @@ def dump_rules(data: dict, path: str) -> None:
             if match.get("subject_contains"):
                 items = ", ".join(_q(x) for x in match["subject_contains"])
                 fields.append(f"subject_contains: [{items}]")
-            note = f"  # {rule['note']}" if isinstance(rule, dict) and rule.get("note") else ""
-            out.append("  - match: {" + ", ".join(fields) + "}" + note)
+            entry = "{match: {" + ", ".join(fields) + "}"
+            # note — поле, а не комментарий: комментарии не переживают чтение.
+            if isinstance(rule, dict) and rule.get("note"):
+                entry += f", note: {_q(rule['note'])}"
+            out.append("  - " + entry + "}")
     else:
         out.append("noise: []")
     out.append("")
@@ -248,6 +276,9 @@ def dump_rules(data: dict, path: str) -> None:
             out.append(f"    project: {_q(cat.get('project', ''))}")
             out.append(f"    labels: [{labels}]")
             out.append(f"    privacy: {cat.get('privacy', 'normal')}")
+            if cat.get("terminal") is True:
+                # Опасный опт-ин: правило само решает судьбу письма без LLM.
+                out.append("    terminal: true")
     else:
         out.append("routing: {}")
     out.append("")
@@ -299,23 +330,49 @@ def match_email(rules: dict, sender: str, subject: str) -> dict:
             if needle and needle.lower() in subj:
                 return {"verdict": "noise", "matched_on": f"subject:{needle}", "level": 2}
 
-    for name, cat in (rules.get("routing") or {}).items():
-        cat = cat or {}
-        for dom in cat.get("from_domains") or []:
-            if dom and dom.strip().lower() == sender_dom:
-                return _route(name, cat, f"from_domain:{dom}")
-        for kw in cat.get("keywords") or []:
-            if kw and kw.lower() in subj:
-                return _route(name, cat, f"keyword:{kw}")
-
     defaults = rules.get("defaults") or {}
-    return {
+    unresolved = {
         "verdict": "unresolved",
         "level": 3,
         "next": "classification (LLM)",
         "fallback_team": defaults.get("team", ""),
         "fallback_project": defaults.get("project", ""),
     }
+
+    for name, cat in (rules.get("routing") or {}).items():
+        cat = cat or {}
+        matched_on = ""
+        for dom in cat.get("from_domains") or []:
+            if dom and dom.strip().lower() == sender_dom:
+                matched_on = f"from_domain:{dom}"
+                break
+        if not matched_on:
+            for kw in cat.get("keywords") or []:
+                if kw and kw.lower() in subj:
+                    matched_on = f"keyword:{kw}"
+                    break
+        if not matched_on:
+            continue
+        # Категория говорит, КУДА положить, но не отвечает на вопрос, НУЖНО ЛИ
+        # вообще заводить задачу. Поэтому по умолчанию это подсказка, а решение
+        # принимает уровень 3. Терминальным правило становится только при явном
+        # terminal: true в категории.
+        if cat.get("terminal") is True:
+            return _route(name, cat, matched_on)
+        hint = dict(unresolved)
+        hint.update(
+            {
+                "suggested_category": name,
+                "matched_on": matched_on,
+                "suggested_team": cat.get("team", "") or defaults.get("team", ""),
+                "suggested_project": cat.get("project", "") or defaults.get("project", ""),
+                "labels": cat.get("labels") or [],
+                "privacy": cat.get("privacy", "normal"),
+            }
+        )
+        return hint
+
+    return unresolved
 
 
 def _route(name: str, cat: dict, matched_on: str) -> dict:
@@ -376,6 +433,37 @@ def _parse_dt(value: str):
     return dt
 
 
+def _due_date(value: str, tzinfo):
+    """Дедлайн в виде календарной даты.
+
+    `2026-09-05` — это дата, а не момент времени. Прогонять её через
+    UTC-полночь и astimezone нельзя: в любой зоне западнее UTC дата уезжает
+    на сутки назад, и «дедлайн сегодня» превращается в «просрочено на день».
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            return None
+    parsed = _parse_dt(raw)
+    return parsed.astimezone(tzinfo).date() if parsed else None
+
+
+def _is_started(state: str, state_type: str) -> bool:
+    if str(state_type or "").strip().lower() in STARTED_TYPES:
+        return True
+    return (state or "").strip().lower() in STARTED_NAMES
+
+
+def _is_closed(state: str, state_type: str) -> bool:
+    if str(state_type or "").strip().lower() in CLOSED_TYPES:
+        return True
+    return (state or "").strip().lower() in CLOSED_NAMES
+
+
 def _plural_days(n: int) -> str:
     n = abs(n)
     if n % 10 == 1 and n % 100 != 11:
@@ -385,7 +473,10 @@ def _plural_days(n: int) -> str:
     return "дней"
 
 
-def issue_status(due: str, updated: str, state: str, tz: str, now: str, stale_days: int) -> dict:
+def issue_status(
+    due: str, updated: str, state: str, tz: str, now: str, stale_days: int,
+    state_type: str = "",
+) -> dict:
     tzinfo = timezone.utc
     if tz and ZoneInfo:
         try:
@@ -395,13 +486,11 @@ def issue_status(due: str, updated: str, state: str, tz: str, now: str, stale_da
     now_dt = (_parse_dt(now) or datetime.now(timezone.utc)).astimezone(tzinfo)
     today = now_dt.date()
 
-    state_norm = (state or "").strip().lower()
-    if state_norm in ("done", "completed", "cancelled", "canceled"):
+    if _is_closed(state, state_type):
         return {"status": "closed", "detail": "", "include": False}
 
-    due_dt = _parse_dt(due)
-    if due_dt:
-        due_date = due_dt.astimezone(tzinfo).date()
+    due_date = _due_date(due, tzinfo)
+    if due_date:
         delta = (due_date - today).days
         if delta < 0:
             return {
@@ -423,7 +512,7 @@ def issue_status(due: str, updated: str, state: str, tz: str, now: str, stale_da
             }
 
     updated_dt = _parse_dt(updated)
-    if updated_dt and state_norm in ("in progress", "started", "in_progress"):
+    if updated_dt and _is_started(state, state_type):
         idle = (now_dt - updated_dt.astimezone(tzinfo)).days
         if idle >= stale_days:
             return {
@@ -466,19 +555,33 @@ def _state_value(issue: dict) -> str:
     return str(value)
 
 
+def _state_type_value(issue: dict) -> str:
+    value = issue.get("statusType") or issue.get("stateType") or ""
+    if isinstance(issue.get("state"), dict):
+        value = issue["state"].get("type") or value
+    return str(value)
+
+
 def _one_job_rank(issue: dict, tz: str, now: str, stale_days: int) -> tuple:
     """Меньший tuple означает более срочную задачу."""
     state = _state_value(issue)
     due = str(_issue_field(issue, "dueDate", "due_date", default=""))
     updated = str(_issue_field(issue, "updatedAt", "updated_at", default=""))
-    status = issue_status(due, updated, state, tz, now, stale_days)
+    status = issue_status(due, updated, state, tz, now, stale_days, _state_type_value(issue))
     status_rank = {"overdue": 0, "due_soon": 1, "stale": 2, "ok": 3}.get(status["status"], 3)
     days = status.get("days", 10**9)
-    date_rank = days if status["status"] in ("overdue", "due_soon", "stale") else 10**9
+    if status["status"] in ("overdue", "due_soon"):
+        date_rank = days          # чем отрицательнее, тем старее просрочка
+    elif status["status"] == "stale":
+        date_rank = -days         # чем дольше висит, тем выше
+    else:
+        date_rank = 10**9
     priority = _priority_value(issue)
     priority_rank = priority if priority in (1, 2, 3, 4) else 5
     updated_dt = _parse_dt(updated)
-    freshness_rank = -(updated_dt.timestamp()) if updated_dt else 0
+    # Тайбрейк: свежее обновление выше. Без updatedAt задача считается самой
+    # старой — это последний ключ, на выбор группы он уже не влияет.
+    freshness_rank = -(updated_dt.timestamp()) if updated_dt else 0.0
     stable_id = str(_issue_field(issue, "identifier", "id", default=""))
     return status_rank, priority_rank, date_rank, freshness_rank, stable_id
 
@@ -489,13 +592,7 @@ def select_one_job(issues: list, tz: str, now: str, stale_days: int = 14) -> dic
     for issue in issues:
         if not isinstance(issue, dict):
             continue
-        state = _state_value(issue).strip().lower()
-        state_type = issue.get("statusType") or issue.get("stateType") or ""
-        if isinstance(issue.get("state"), dict):
-            state_type = issue["state"].get("type") or state_type
-        if state in ("done", "completed", "cancelled", "canceled") or str(state_type).lower() in (
-            "completed", "canceled", "cancelled"
-        ):
+        if _is_closed(_state_value(issue), _state_type_value(issue)):
             continue
         active.append(issue)
 
@@ -515,7 +612,10 @@ def select_one_job(issues: list, tz: str, now: str, stale_days: int = 14) -> dic
     selected = min(unique.values(), key=lambda item: _one_job_rank(item, tz, now, stale_days))
     due = str(_issue_field(selected, "dueDate", "due_date", default=""))
     updated = str(_issue_field(selected, "updatedAt", "updated_at", default=""))
-    status = issue_status(due, updated, _state_value(selected), tz, now, stale_days)
+    status = issue_status(
+        due, updated, _state_value(selected), tz, now, stale_days,
+        _state_type_value(selected),
+    )
     project = selected.get("project")
     if isinstance(project, dict):
         project = project.get("name") or project.get("id")
@@ -543,11 +643,24 @@ def select_one_job(issues: list, tz: str, now: str, stale_days: int = 14) -> dic
 # --------------------------------------------------------------------------
 
 
+def _with_rules_meta(result: dict, rules: dict, path: str) -> dict:
+    result["rules_path"] = os.path.abspath(path)
+    result["rules_found"] = bool(rules.get("_found"))
+    if not result["rules_found"]:
+        result["warning"] = (
+            "routing-rules.yaml не найден — team/project пустые. "
+            "Проверь путь или запусти `jarvis.py init`."
+        )
+    return result
+
+
 def cmd_match(args) -> dict:
     rules = load_rules(args.rules)
     if args.category:
-        return resolve_category(rules, args.category)
-    return match_email(rules, args.sender or "", args.subject or "")
+        result = resolve_category(rules, args.category)
+    else:
+        result = match_email(rules, args.sender or "", args.subject or "")
+    return _with_rules_meta(result, rules, args.rules)
 
 
 def cmd_add_noise(args) -> dict:
@@ -592,6 +705,8 @@ def cmd_add_route(args) -> dict:
         cat["project"] = args.project
     if args.privacy:
         cat["privacy"] = args.privacy
+    if args.terminal is not None:
+        cat["terminal"] = args.terminal
     dump_rules(rules, args.rules)
     return {"ok": True, "category": args.category, "rule": cat}
 
@@ -616,7 +731,10 @@ def cmd_init(args) -> dict:
 
 
 def cmd_dates(args) -> dict:
-    return issue_status(args.due, args.updated, args.state, args.tz, args.now, args.stale_days)
+    return issue_status(
+        args.due, args.updated, args.state, args.tz, args.now, args.stale_days,
+        getattr(args, "state_type", ""),
+    )
 
 
 def cmd_one_job(args) -> dict:
@@ -638,8 +756,11 @@ def cmd_selftest(_args) -> dict:
     import tempfile
 
     failures = []
+    ran = 0
 
     def check(name, got, want):
+        nonlocal ran
+        ran += 1
         if got != want:
             failures.append({"case": name, "got": got, "want": want})
 
@@ -675,13 +796,47 @@ def cmd_selftest(_args) -> dict:
     cmd_add_route(
         argparse.Namespace(
             rules=path, category="home", keyword=["отключение"], from_domain=[],
-            team="T2", project="P2", privacy="normal",
+            team="T2", project="P2", privacy="normal", terminal=None,
         )
     )
     rules = load_rules(path)
     routed = match_email(rules, "uk@dom.ru", "Отключение электричества 22.08")
-    check("route by keyword", (routed["verdict"], routed["team"]), ("route", "T2"))
-    check("route case-insensitive", match_email(rules, "uk@dom.ru", "ОТКЛЮЧЕНИЕ воды")["verdict"], "route")
+    check(
+        "routing match is a hint, not a verdict",
+        (routed["verdict"], routed["suggested_category"], routed["suggested_team"]),
+        ("unresolved", "home", "T2"),
+    )
+    check(
+        "routing hint still goes to LLM",
+        match_email(rules, "uk@dom.ru", "ОТКЛЮЧЕНИЕ воды")["level"],
+        3,
+    )
+    check("no routing match -> no suggestion", "suggested_category" in match_email(
+        rules, "a@other.com", "Ничего"), False)
+
+    cmd_add_route(
+        argparse.Namespace(
+            rules=path, category="home", keyword=[], from_domain=[],
+            team=None, project=None, privacy=None, terminal=True,
+        )
+    )
+    rules = load_rules(path)
+    terminal = match_email(rules, "uk@dom.ru", "Отключение электричества")
+    check("terminal: true opts back into route verdict", terminal["verdict"], "route")
+    check("terminal route carries destination", terminal["team"], "T2")
+
+    cmd_add_route(
+        argparse.Namespace(
+            rules=path, category="home", keyword=[], from_domain=[],
+            team=None, project=None, privacy=None, terminal=False,
+        )
+    )
+    rules = load_rules(path)
+    check(
+        "terminal can be turned back off",
+        match_email(rules, "uk@dom.ru", "Отключение электричества")["verdict"],
+        "unresolved",
+    )
 
     check("resolve known category", resolve_category(rules, "home")["team"], "T2")
     check("resolve unknown category", resolve_category(rules, "medical")["source"], "defaults")
@@ -712,6 +867,40 @@ def cmd_selftest(_args) -> dict:
         issue_status("", "2026-08-19T00:00:00Z", "In Progress", "Europe/Moscow", now, 14)["status"],
         "ok",
     )
+    # Регресс: дата без времени — календарная, а не UTC-полночь.
+    check(
+        "due today in negative UTC offset",
+        issue_status("2026-09-05", "", "Todo", "America/New_York",
+                     "2026-09-05T12:00:00-04:00", 14)["status"],
+        "due_soon",
+    )
+    check(
+        "due today in positive UTC offset",
+        issue_status("2026-09-05", "", "Todo", "Europe/Moscow",
+                     "2026-09-05T12:00:00+03:00", 14)["status"],
+        "due_soon",
+    )
+
+    # Регресс: stale определяется по statusType, а не по имени статуса.
+    check(
+        "stale by state type with custom status name",
+        issue_status("", "2026-08-01T00:00:00Z", "In Review", "Europe/Moscow",
+                     now, 14, "started")["status"],
+        "stale",
+    )
+    check(
+        "closed by state type with custom status name",
+        issue_status("2026-01-01", "", "Shipped", "Europe/Moscow",
+                     now, 14, "completed")["include"],
+        False,
+    )
+    check(
+        "backlog is not stale",
+        issue_status("", "2026-01-01T00:00:00Z", "Backlog", "Europe/Moscow",
+                     now, 14, "backlog")["status"],
+        "ok",
+    )
+
     check("plural 1", _plural_days(1), "день")
     check("plural 11", _plural_days(11), "дней")
     check("plural 22", _plural_days(22), "дня")
@@ -747,22 +936,68 @@ def cmd_selftest(_args) -> dict:
     check("one job keeps strongest duplicate", deduped["selected"]["id"], "BRA-6")
     check("one job empty", select_one_job([], "Europe/Moscow", now)["selected"], None)
 
+    # Регресс: note переживает повторную запись файла (раньше терялся,
+    # потому что писался комментарием).
+    cmd_add_noise(
+        argparse.Namespace(
+            rules=path, sender=None, from_domain="shop.example.com",
+            subject_contains=None, note="просил 21.08, магазин",
+        )
+    )
+    cmd_add_noise(
+        argparse.Namespace(
+            rules=path, sender=None, from_domain=None,
+            subject_contains=["дайджест"], note="второе правило",
+        )
+    )
+    rules = load_rules(path)
+    notes = {
+        rule["match"].get("from_domain"): rule.get("note")
+        for rule in rules["noise"] if isinstance(rule, dict)
+    }
+    check("note survives a later write", notes.get("shop.example.com"), "просил 21.08, магазин")
+
     # Fallback-парсер должен читать то, что пишет dump_rules.
     with open(path, "r", encoding="utf-8") as fh:
-        fallback = _fallback_load(fh.read())
+        raw = fh.read()
+    fallback = _fallback_load(raw)
     check("fallback parser defaults", fallback.get("defaults"), {"team": "T1", "project": "P1"})
     check(
         "fallback parser routing",
-        match_email(fallback, "uk@dom.ru", "Отключение воды")["verdict"],
-        "route",
+        match_email(fallback, "uk@dom.ru", "Отключение воды").get("suggested_category"),
+        "home",
+    )
+    fallback_notes = {
+        rule["match"].get("from_domain"): rule.get("note")
+        for rule in fallback["noise"] if isinstance(rule, dict)
+    }
+    check(
+        "fallback parser keeps note with a comma",
+        fallback_notes.get("shop.example.com"),
+        "просил 21.08, магазин",
     )
 
-    return {"ok": not failures, "failures": failures, "checks_run": 22}
+    # Регресс: отсутствующий файл правил больше не выглядит как «нет правил».
+    missing = cmd_match(
+        argparse.Namespace(
+            rules=os.path.join(tmpdir, "nope.yaml"), sender="a@b.com",
+            subject="Тест", category=None,
+        )
+    )
+    check("missing rules file is reported", missing["rules_found"], False)
+    check("missing rules file explains itself", "warning" in missing, True)
+
+    present = cmd_match(
+        argparse.Namespace(rules=path, sender="a@b.com", subject="Тест", category=None)
+    )
+    check("present rules file is reported", present["rules_found"], True)
+
+    return {"ok": not failures, "failures": failures, "checks_run": ran}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Детерминированные операции Jarvis")
-    default_rules = os.environ.get("JARVIS_RULES", "assets/routing-rules.yaml")
+    default_rules = os.environ.get("JARVIS_RULES", DEFAULT_RULES_PATH)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("match", help="сопоставить письмо с правилами уровня 2")
@@ -788,6 +1023,10 @@ def main() -> int:
     p.add_argument("--team")
     p.add_argument("--project")
     p.add_argument("--privacy", choices=["normal", "strict"])
+    p.add_argument(
+        "--terminal", dest="terminal", action="store_true", default=None,
+        help="правило решает судьбу письма без LLM (по умолчанию — только подсказка)",
+    )
     p.set_defaults(fn=cmd_add_route)
 
     p = sub.add_parser("harden", help="записать созданный провайдерский фильтр в аудит")
@@ -808,6 +1047,10 @@ def main() -> int:
     p.add_argument("--due", default="")
     p.add_argument("--updated", default="")
     p.add_argument("--state", default="")
+    p.add_argument(
+        "--state-type", default="",
+        help="statusType из Linear: backlog|unstarted|started|completed|canceled",
+    )
     p.add_argument("--tz", default=os.environ.get("JARVIS_TZ", "UTC"))
     p.add_argument("--now", default="")
     p.add_argument("--stale-days", type=int, default=14)
