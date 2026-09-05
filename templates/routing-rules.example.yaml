@@ -1,0 +1,45 @@
+version: 1
+
+# Пример заполненного файла. Рабочий лежит в assets/routing-rules.yaml и
+# создаётся командой: python3 scripts/jarvis.py init --team <ID> --project <ID>
+#
+# Внимание: скрипт перезаписывает файл канонически и не сохраняет комментарии.
+# Пометки к правилам храни в поле note.
+
+# Уровень 2: шум. Пополняется фидбеком "это шум".
+noise:
+  - match: {from_domain: "news.example.com"}
+  - match: {subject_contains: ["дайджест", "unsubscribe"]}
+
+# Фильтры, поднятые на сторону провайдера. Только аудит, на матчинг не влияет.
+senders_hardened: []
+
+# Категории роутинга -> назначение в Linear.
+# Заводятся по ходу дела фидбеком "это в проект X", а не заранее.
+routing:
+  home:
+    keywords: ["управляющая компания", "отключение", "коммунальные", "квитанция"]
+    from_domains: []
+    team: "<TEAM_ID>"
+    project: "<PROJECT_ID>"
+    labels: []
+    privacy: normal
+  medical:
+    keywords: ["анализ", "результаты анализов", "клиника", "приём врача"]
+    from_domains: []
+    team: "<TEAM_ID>"
+    project: "<PROJECT_ID>"
+    labels: []
+    privacy: strict
+  finance:
+    keywords: ["счёт", "оплата", "инвойс", "invoice"]
+    from_domains: []
+    team: "<TEAM_ID>"
+    project: "<PROJECT_ID>"
+    labels: []
+    privacy: normal
+
+# Единственный источник правды для дефолтного назначения в Linear.
+defaults:
+  team: "<DEFAULT_TEAM_ID>"
+  project: "<DEFAULT_PROJECT_ID>"
